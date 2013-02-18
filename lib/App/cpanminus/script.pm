@@ -84,6 +84,7 @@ sub new {
         save_dists => undef,
         skip_configure => 0,
         verify => 0,
+        refspec => undef,
         @_,
     }, $class;
 }
@@ -147,6 +148,7 @@ sub parse_options {
         'skip-configure!' => \$self->{skip_configure},
         'dev!'       => \$self->{dev_release},
         'metacpan!'  => \$self->{metacpan},
+        'refspec=s'  => sub { $self->{refspec} = $_[1]; }
     );
 
     if (!@ARGV && $0 ne '-' && !-t STDIN){ # e.g. # cpanm < author/requires.cpanm
@@ -1478,6 +1480,18 @@ sub git_uri {
     unless (-e "$dir/.git") {
         $self->diag_fail("Failed cloning git repository $uri");
         return;
+    }
+
+    $self->diag_ok;
+
+    if (defined $self->{refspec}) {
+        $self->diag_progress("Checking out refspec $self->{refspec}");
+        $self->chdir($dir);
+        my $status = $self->run("git checkout $self->{refspec}");
+        if ($status ne 1) {
+            $self->diag_fail("Failed checkout refspec $self->{refspec}");
+            return;
+        }
     }
 
     $self->diag_ok;
