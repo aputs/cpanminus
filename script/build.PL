@@ -11,6 +11,9 @@
 
 =cut
 
+eval("use App::FatPacker");
+die "Please Install App::FatPacker first!\n" if $@;
+
 open my $in,  "<", "script/cpanm.PL" or die $!;
 open my $out, ">", "cpanm.tmp" or die $!;
 
