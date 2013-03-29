@@ -1,5 +1,5 @@
 package App::cpanminus;
-our $VERSION = "1.59_12";
+our $VERSION = "1.6102";
 
 =head1 NAME
 
@@ -119,6 +119,12 @@ The site is updated at least every hour to reflect the latest changes
 from fast syncing mirrors. The script then also falls back to query the
 module at L<http://metacpan.org/> using its wonderful API.
 
+Upon calling these API hosts, cpanm (1.6004 or later) will send the
+local perl versions to the server in User-Agent string by default. You
+can turn it off with C<--no-report-perl-version> option. Read more
+about the option with L<cpanm>, and read more about the privacy policy
+about this data collection at L<http://cpanmetadb.plackperl.org/#privacy>
+
 Fetched files are unpacked in C<~/.cpanm> and automatically cleaned up
 periodically.  You can configure the location of this with the
 C<PERL_CPANM_HOME> environment variable.
@@ -228,9 +234,11 @@ The standalone executable contains the following modules embedded.
 
 =item L<JSON::PP> Copyright 2007−2011 by Makamaka Hannyaharamitu
 
-=item L<CPAN::Meta::Requirements> Copyright (c) 2010 by David Golden and Ricardo Signes
+=item L<CPAN::Meta>, L<CPAN::Meta::Requirements> Copyright (c) 2010 by David Golden and Ricardo Signes
 
 =item L<CPAN::Meta::YAML> Copyright 2010 Adam Kennedy
+
+=item L<File::pushd> Copyright 2012 David Golden
 
 =back
 

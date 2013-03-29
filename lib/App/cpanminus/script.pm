@@ -21,10 +21,19 @@ our $VERSION = $App::cpanminus::VERSION;
 if ($INC{"App/FatPacker/Trace.pm"}) {
     require JSON::PP;
     require CPAN::Meta::YAML;
+    require CPAN::Meta::Prereqs;
     require version::vpp;
+    require File::pushd;
 }
 
 my $quote = WIN32 ? q/"/ : q/'/;
+
+sub agent {
+    my $self = shift;
+    my $agent = "cpanminus/$VERSION";
+    $agent .= " perl/$]" if $self->{report_perl_version};
+    $agent;
+}
 
 sub determine_home {
     my $class = shift;
@@ -84,6 +93,7 @@ sub new {
         save_dists => undef,
         skip_configure => 0,
         verify => 0,
+        report_perl_version => 1,
         refspec => undef,
         @_,
     }, $class;
@@ -148,6 +158,7 @@ sub parse_options {
         'skip-configure!' => \$self->{skip_configure},
         'dev!'       => \$self->{dev_release},
         'metacpan!'  => \$self->{metacpan},
+        'report-perl-version!' => \$self->{report_perl_version},
         'refspec=s'  => sub { $self->{refspec} = $_[1]; }
     );
 
@@ -214,7 +225,8 @@ sub parse_module_args {
     my($self, $module) = @_;
 
     # Plack@1.2 -> Plack~"==1.2"
-    $module =~ s/@([v\d\._]+)$/~== $1/;
+    # BUT don't expand @ in git URLs
+    $module =~ s/^([A-Za-z0-9_:]+)@([v\d\._]+)$/$1~== $2/;
 
     # Plack~1.20, DBI~"> 1.0, <= 2.0"
     if ($module =~ /\~[v\d\._,\!<>= ]+$/) {
@@ -460,12 +472,19 @@ sub numify_ver {
 sub maturity_filter {
     my($self, $module, $version) = @_;
 
-    # TODO: might be better dev release can be enabled per dist
-    if ($self->{dev_release}) {
-        return;
-    } else {
-        return { term => { maturity => 'released' } };
+    my @filters;
+
+    # TODO: dev release should be enabled per dist
+    if (!$self->with_version_range($version) or $self->{dev_release}) {
+        # backpan'ed dev release are considered "cancelled"
+        push @filters, { not => { term => { status => 'backpan' } } };
     }
+
+    unless ($self->{dev_release} or $version =~ /==/) {
+        push @filters, { term => { maturity => 'released' } };
+    }
+
+    return @filters;
 }
 
 sub search_metacpan {
@@ -477,11 +496,10 @@ sub search_metacpan {
 
     my $metacpan_uri = 'http://api.metacpan.org/v0';
 
+    my @filter = $self->maturity_filter($module, $version);
+
     my $query = { filtered => {
-        filter => { and => [
-            { not => { term => { status => 'backpan' } } },
-            $self->maturity_filter($module, $version)
-        ] },
+        (@filter ? (filter => { and => \@filter }) : ()),
         query => { nested => {
             score_mode => 'max',
             path => 'module',
@@ -526,7 +544,7 @@ sub search_metacpan {
         filter => {
             term => { 'release.name' => $release },
         },
-        fields => [ 'download_url', 'stat' ],
+        fields => [ 'download_url', 'stat', 'status' ],
     });
 
     my $dist_json = $self->get($dist_uri);
@@ -538,8 +556,10 @@ sub search_metacpan {
     if ($dist_meta && $dist_meta->{download_url}) {
         (my $distfile = $dist_meta->{download_url}) =~ s!.+/authors/id/!!;
         local $self->{mirrors} = $self->{mirrors};
-        if ($dist_meta->{stat}->{mtime} > time()-24*60*60) {
-            $self->{mirrors} = ['http://cpan.metacpan.org'];
+        if ($dist_meta->{status} eq 'backpan') {
+            $self->{mirrors} = [ 'http://backpan.perl.org' ];
+        } elsif ($dist_meta->{stat}{mtime} > time()-24*60*60) {
+            $self->{mirrors} = [ 'http://cpan.metacpan.org' ];
         }
         return $self->cpan_module($module, $distfile, $module_version);
     }
@@ -1251,7 +1271,9 @@ sub fetch_module {
         next unless $dir; # unpack failed
 
         if (my $save = $self->{save_dists}) {
-            my $path = "$save/authors/id/$dist->{pathname}";
+            # Only distros retrieved from CPAN have a pathname set
+            my $path = $dist->{pathname} ? "$save/authors/id/$dist->{pathname}"
+                                         : "$save/vendor/$file";
             $self->chat("Copying $name to $path\n");
             File::Path::mkpath([ File::Basename::dirname($path) ], 0, 0777);
             File::Copy::copy($file, $path) or warn $!;
@@ -1423,8 +1445,9 @@ sub resolve_name {
     }
 
     # PAUSEID/foo
-    if ($module =~ m!([A-Z]{3,})/!) {
-        return $self->cpan_dist($module);
+    # P/PA/PAUSEID/foo
+    if ($module =~ m!^(?:[A-Z]/[A-Z]{2}/)?([A-Z]{2,}/.*)$!) {
+        return $self->cpan_dist($1);
     }
 
     # Module name
@@ -1471,15 +1494,29 @@ sub cpan_dist {
 sub git_uri {
     my ($self, $uri) = @_;
 
-    my $dh  = File::Temp->newdir(CLEANUP => 1);
-    my $dir = Cwd::abs_path($dh->dirname);
+    # similar to http://www.pip-installer.org/en/latest/logic.html#vcs-support
+    # git URL has to end with .git when you need to use pin @ commit/tag/branch
+
+    ($uri, my $commitish) = split /(?<=\.git)@/i, $uri, 2;
+
+    my $dir = File::Temp::tempdir(CLEANUP => 1);
 
     $self->diag_progress("Cloning $uri");
-    $self->run("git clone $uri $dir");
+    $self->run([ 'git', 'clone', $uri, $dir ]);
 
     unless (-e "$dir/.git") {
         $self->diag_fail("Failed cloning git repository $uri");
         return;
+    }
+
+    if ($commitish) {
+        require File::pushd;
+        my $dir = File::pushd::pushd($dir);
+
+        unless ($self->run([ 'git', 'checkout', $commitish ])) {
+            $self->diag_fail("Failed to checkout '$commitish' in git repository $uri\n");
+            return;
+        }
     }
 
     $self->diag_ok;
@@ -1499,7 +1536,6 @@ sub git_uri {
     return {
         source => 'local',
         dir    => $dir,
-        handle => $dh,
     };
 }
 
@@ -1520,6 +1556,24 @@ CHECK {
 EOF
 }
 
+sub core_version_for {
+    my($self, $module) = @_;
+
+    require Module::CoreList; # no fatpack
+    unless (exists $Module::CoreList::version{$]+0}) {
+        die sprintf("Module::CoreList %s (loaded from %s) doesn't seem to have entries for perl $]. " .
+                    "You're strongly recommended to upgrade Module::CoreList from CPAN.\n",
+                    $Module::CoreList::VERSION, $INC{"Module/CoreList.pm"});
+    }
+
+    unless (exists $Module::CoreList::version{$]+0}{$module}) {
+        return -1;
+    }
+
+    return $Module::CoreList::version{$]+0}{$module};
+}
+
+
 sub check_module {
     my($self, $mod, $want_ver) = @_;
 
@@ -1533,11 +1587,8 @@ sub check_module {
     # might be newer than (or actually wasn't core at) the version
     # that is shipped with the current perl
     if ($self->{self_contained} && $self->loaded_from_perl_lib($meta)) {
-        require Module::CoreList; # no fatpack
-        unless (exists $Module::CoreList::version{$]+0}{$mod}) {
-            return 0, undef;
-        }
-        $version = $Module::CoreList::version{$]+0}{$mod};
+        $version = $self->core_version_for($mod);
+        return 0, undef if $version && $version == -1;
     }
 
     $self->{local_versions}{$mod} = $version;
@@ -1611,13 +1662,23 @@ sub should_install {
     return;
 }
 
+sub check_perl_version {
+    my($self, $version) = @_;
+    return version->new($]) >= version->new($version);
+}
+
 sub install_deps {
     my($self, $dir, $depth, @deps) = @_;
 
-    my(@install, %seen);
+    my(@install, %seen, @fail);
     while (my($mod, $ver) = splice @deps, 0, 2) {
-        next if $seen{$mod} or $mod eq 'perl' or $mod eq 'Config';
-        if ($self->should_install($mod, $ver)) {
+        next if $seen{$mod};
+        if ($mod eq 'perl') {
+            unless ($self->check_perl_version($ver)) {
+                $self->diag("Needs perl $ver, you only have $]\n");
+                push @fail, 'perl';
+            }
+        } elsif ($self->should_install($mod, $ver)) {
             push @install, [ $mod, $ver ];
             $seen{$mod} = 1;
         }
@@ -1627,7 +1688,6 @@ sub install_deps {
         $self->diag("==> Found dependencies: " . join(", ",  map $_->[0], @install) . "\n");
     }
 
-    my @fail;
     for my $mod (@install) {
         $self->install_module($mod->[0], $depth + 1, $mod->[1])
             or push @fail, $mod->[0];
@@ -1661,7 +1721,6 @@ sub build_stuff {
         $self->verify_signature($dist) or return;
     }
 
-    my @config_deps;
     if (-e 'META.json') {
         $self->chat("Checking configure dependencies from META.json\n");
         $dist->{meta} = $self->parse_meta('META.json');
@@ -1677,7 +1736,15 @@ sub build_stuff {
 
     $dist->{meta} ||= {};
 
-    push @config_deps, %{$dist->{meta}{configure_requires} || {}};
+    my @config_deps;
+
+    if (my $prereqs = $dist->{meta}->{prereqs} ) {
+        push @config_deps, %{$prereqs->{configure}{requires} || {}};
+        push @config_deps, $self->perl_requirements($prereqs->{runtime}{requires}, $prereqs->{build}{requires});
+    } else {
+        push @config_deps, %{$dist->{meta}{configure_requires} || {}};
+        push @config_deps, $self->perl_requirements($dist->{meta}{build_requires}, $dist->{meta}{requires});
+    }
 
     my $target = $dist->{meta}{name} ? "$dist->{meta}{name}-$dist->{meta}{version}" : $dist->{dir};
 
@@ -1690,7 +1757,11 @@ sub build_stuff {
 
     $self->diag_ok($configure_state->{configured_ok} ? "OK" : "N/A");
 
-    my @deps = $self->find_prereqs($dist);
+    # install direct 'test' dependencies for --installdeps, even with --notest
+    my @want_phase = $self->{notest} && !($self->{installdeps} && $depth == 0)
+                   ? qw( build runtime ) : qw( build test runtime );
+
+    my @deps = $self->find_prereqs($dist, \@want_phase);
     my $module_name = $self->find_module_name($configure_state) || $dist->{meta}{name};
     $module_name =~ s/-/::/g;
 
@@ -1788,12 +1859,26 @@ DIAG
     }
 }
 
+sub perl_requirements {
+    my($self, @requires) = @_;
+
+    my @perl;
+    for my $requires (grep defined, @requires) {
+        if (exists $requires->{perl}) {
+            push @perl, perl => $requires->{perl};
+        }
+    }
+
+    return @perl;
+}
+
 sub configure_this {
     my($self, $dist, $depth) = @_;
 
     if (-e 'cpanfile' && $self->{installdeps} && $depth == 0) {
         require Module::CPANfile;
         $dist->{cpanfile} = eval { Module::CPANfile->load('cpanfile') };
+        $self->diag_fail($@, 1) if $@;
         return {
             configured       => 1,
             configured_ok    => !!$dist->{cpanfile},
@@ -1903,12 +1988,13 @@ sub save_meta {
     my $base = ($ENV{PERL_MM_OPT} || '') =~ /INSTALL_BASE=/
         ? ($self->install_base($ENV{PERL_MM_OPT}) . "/lib/perl5") : $Config{sitelibexp};
 
+    require Module::Metadata;
     my $provides = $self->_merge_hashref(
         map Module::Metadata->package_versions_from_directory($_),
             qw( blib/lib blib/arch ) # FCGI.pm :(
     );
 
-    mkdir "blib/meta", 0777 or die $!;
+    File::Path::mkpath("blib/meta", 0, 0777);
 
     my $local = {
         name => $module_name,
@@ -1961,9 +2047,9 @@ sub safe_eval {
 }
 
 sub find_prereqs {
-    my($self, $dist) = @_;
+    my($self, $dist, $phases) = @_;
 
-    my @deps = $self->extract_meta_prereqs($dist);
+    my @deps = $self->extract_meta_prereqs($dist, $phases);
 
     if ($dist->{module} =~ /^Bundle::/i) {
         push @deps, $self->bundle_deps($dist);
@@ -1973,14 +2059,13 @@ sub find_prereqs {
 }
 
 sub extract_meta_prereqs {
-    my($self, $dist) = @_;
+    my($self, $dist, $phases) = @_;
 
     if ($dist->{cpanfile}) {
         my $prereq = $dist->{cpanfile}->prereq;
-        my @phase = $self->{notest} ? qw( build runtime ) : qw( build test runtime );
         require CPAN::Meta::Requirements;
         my $req = CPAN::Meta::Requirements->new;
-        $req->add_requirements($prereq->requirements_for($_, 'requires')) for @phase;
+        $req->add_requirements($prereq->requirements_for($_, 'requires')) for @$phases;
         return %{$req->as_string_hash};
     }
 
@@ -1994,7 +2079,7 @@ sub extract_meta_prereqs {
         my $mymeta = JSON::PP::decode_json($json);
         if ($mymeta) {
             $meta->{$_} = $mymeta->{$_} for qw(name version);
-            return $self->extract_requires($mymeta);
+            return $self->extract_requires($mymeta, $phases);
         }
     }
 
@@ -2003,14 +2088,14 @@ sub extract_meta_prereqs {
         my $mymeta = $self->parse_meta('MYMETA.yml');
         if ($mymeta) {
             $meta->{$_} = $mymeta->{$_} for qw(name version);
-            return $self->extract_requires($mymeta);
+            return $self->extract_requires($mymeta, $phases);
         }
     }
 
     if (-e '_build/prereqs') {
         $self->chat("Checking dependencies from _build/prereqs ...\n");
         my $mymeta = do { open my $in, "_build/prereqs"; $self->safe_eval(join "", <$in>) };
-        @deps = $self->extract_requires($mymeta);
+        @deps = $self->extract_requires($mymeta, $phases);
     } elsif (-e 'Makefile') {
         $self->chat("Finding PREREQ from Makefile ...\n");
         open my $mf, "Makefile";
@@ -2068,14 +2153,13 @@ sub maybe_version {
 }
 
 sub extract_requires {
-    my($self, $meta) = @_;
+    my($self, $meta, $phases) = @_;
 
     if ($meta->{'meta-spec'} && $meta->{'meta-spec'}{version} == 2) {
-        my @phase = $self->{notest} ? qw( build runtime ) : qw( build test runtime );
         my @deps = map {
             my $p = $meta->{prereqs}{$_} || {};
             %{$p->{requires} || {}};
-        } @phase;
+        } @$phases;
         return @deps;
     }
 
@@ -2102,7 +2186,11 @@ sub cleanup_workdirs {
     }
 
     if (@targets) {
-        $self->chat("Expiring ", scalar(@targets), " work directories.\n");
+        if (@targets >= 64) {
+            $self->diag("Expiring ", scalar(@targets), " work directories. This might take long...\n");
+        } else {
+            $self->chat("Expiring ", scalar(@targets), " work directories.\n");
+        }
         File::Path::rmtree(\@targets, 0, 0); # safe = 0, since blib usually doesn't have write bits
     }
 }
@@ -2179,11 +2267,12 @@ sub shell_quote {
 
 sub which {
     my($self, $name) = @_;
+    return $name if File::Spec->file_name_is_absolute($name) && -x $name;
     my $exe_ext = $Config{_exe};
     for my $dir (File::Spec->path) {
         my $fullpath = File::Spec->catfile($dir, $name);
         if (-x $fullpath || -x ($fullpath .= $exe_ext)) {
-            if ($fullpath =~ /\s/ && $fullpath !~ /^$quote/) {
+            if ($fullpath =~ /\s/) {
                 $fullpath = $self->shell_quote($fullpath);
             }
             return $fullpath;
@@ -2254,7 +2343,7 @@ sub init_tools {
             LWP::UserAgent->new(
                 parse_head => 0,
                 env_proxy => 1,
-                agent => "cpanminus/$VERSION",
+                agent => $self->agent,
                 timeout => 30,
                 @_,
             );
@@ -2273,7 +2362,7 @@ sub init_tools {
     } elsif ($self->{try_wget} and my $wget = $self->which('wget')) {
         $self->chat("You have $wget\n");
         my @common = (
-            '--user-agent', "cpanminus/$VERSION",
+            '--user-agent', $self->agent,
             '--retry-connrefused',
             ($self->{verbose} ? () : ('-q')),
         );
@@ -2293,7 +2382,7 @@ sub init_tools {
         $self->chat("You have $curl\n");
         my @common = (
             '--location',
-            '--user-agent', "cpanminus/$VERSION",
+            '--user-agent', $self->agent,
             ($self->{verbose} ? () : '-s'),
         );
         $self->{_backends}{get} = sub {
@@ -2312,7 +2401,7 @@ sub init_tools {
         require HTTP::Tiny;
         $self->chat("Falling back to HTTP::Tiny $HTTP::Tiny::VERSION\n");
         my %common = (
-            agent => "cpanminus/$VERSION",
+            agent => $self->agent,
         );
         $self->{_backends}{get} = sub {
             my $self = shift;
@@ -2427,7 +2516,7 @@ sub init_tools {
                 or return undef;
 
             chomp $root;
-            $root =~ s{^\s+testing:\s+(.+?)/\s+OK$}{$1};
+            $root =~ s{^\s+testing:\s+([^/]+)/.*?\s+OK$}{$1};
 
             system "$unzip $opt $zipfile";
             return $root if -d $root;
@@ -2446,15 +2535,16 @@ sub init_tools {
             $self->diag_fail("Read of file[$file] failed")
                 if $status != Archive::Zip::AZ_OK();
             my @members = $zip->members();
-            my $root;
             for my $member ( @members ) {
                 my $af = $member->fileName();
                 next if ($af =~ m!^(/|\.\./)!);
-                $root = $af unless $root;
                 $status = $member->extractToFileNamed( $af );
                 $self->diag_fail("Extracting of file[$af] from zipfile[$file failed")
                     if $status != Archive::Zip::AZ_OK();
             }
+
+            my ($root) = $zip->membersMatching( qr<^[^/]+/$> );
+            $root &&= $root->fileName;
             return -d $root ? $root : undef;
         };
     }

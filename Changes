@@ -1,5 +1,77 @@
 See http://github.com/miyagawa/cpanminus/ for the latest development.
 
+1.6102  Wed Mar 27 17:14:18 PDT 2013
+   [Improvements]
+      - Added a safe guard check if Module::CoreList loaded is broken/outdated (jdb)
+      - Removed the check to see if make executable begins with quotes (jdb, charsbar)
+      - Added to load Module::Metadata in post-installation #226
+
+1.6101  Mon Mar 25 13:39:56 PDT 2013
+   [Improvements]
+      - Always install direct test dependencies with --installdeps even when
+        --notest option is used. This should make Travis CI users happy #222 (hide_o_55)
+
+1.6100  Sun Mar 24 21:09:30 PDT 2013
+   [Improvements]
+      - Support 'perl' key in requires (aka The Oslo Consensus) #221 (tokuhirom)
+      - Gives warnings when pruning lots of work directories (xdg)
+
+1.6008  Tue Mar 19 09:07:43 PDT 2013
+   [Improvements]
+      - Document the link to privacy policy for perl version collection, as well as
+        added option --no-report-perl-version to opt out
+
+1.6007  Sun Mar 17 14:26:07 PDT 2013
+   [Improvements]
+      - Fixed a warning where temp directory created with git install doesn't actually
+        cleanup the temporary directory. (Tim Heaney) #219
+
+1.6006  Wed Mar 13 22:53:44 PDT 2013
+   [Improvements]
+      - Fixed --save-dists option when used with non-CPAN distros. They're now
+        saved into $dir/vendor. (Dave Rolsky) #216
+      - Fixed PAUSE dist path where author ID is only 2 chars (Brian Cassidy) #218
+
+1.6005  Fri Mar  8 11:46:11 PST 2013
+   [Improvements]
+      - Fatpack CPAN::Meta to fix bootstrap failure with --installdeps + cpanfile
+
+1.6004  Fri Mar  8 11:30:37 PST 2013
+   [Improvements]
+      - Add perl version to User-Agent strings
+
+1.6003  Fri Mar  8 10:57:13 PST 2013
+   [Improvements]
+      - Display cpanfile syntax error if any (robario)
+      - Fixed failure to install oddly laid out dists without blib (winfinit)
+
+1.6002  Wed Feb 27 12:12:09 PST 2013
+   [Improvements]
+      - Support parsing configure dependencies from META.json in spec 2 (kazeburo)
+
+1.6001  Tue Feb 26 16:57:04 PST 2013
+   [Improvements]
+      - Enable developer release if a specific version is requested with == or @. #203
+
+1.6000  Tue Feb 26 09:50:57 PST 2013
+   [Major Changes since 1.5]
+      - Support fixed version search with @version and ~"version range"
+      - MetaCPAN and BackPAN search using MetaCPAN API
+      - --dev to install developer releases
+      - Install via git:// URL (with @branch, tag or commit)
+      - Better MYMETA version range and cpanfile support
+      - No fallback to search.cpan.org, which means you can't install from command names
+
+1.59_13 Mon Feb 25 12:06:44 PST 2013
+   [New Features]
+      - Support @branch (or commit or tag) in Git URLs so that you can specify a
+        commitish to check out before installing from Git repo
+      - Search for BackPAN by default when specific version (or range) is requested
+
+   [Improvements]
+      - Detect .zip root directory more reliably (frioux)
+      - Fixed pathname of the CPAN distribution given as a URL (xaicron)
+
 1.59_12 Wed Feb 13 18:13:49 PST 2013
    [Internals]
       - Switch to metacpan_script for the new MetaCPAN query
